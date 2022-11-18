@@ -25,10 +25,10 @@ from transformers import (
 )
 from transformers.trainer_utils import is_main_process
 from transformers import EarlyStoppingCallback
-from casehold_helpers import MultipleChoiceDataset, Split
 from sklearn.metrics import f1_score
-from models.deberta import DebertaForMultipleChoice
 
+from experiments.casehold_helpers import MultipleChoiceDataset, Split
+from models.deberta import DebertaForMultipleChoice
 
 logger = logging.getLogger(__name__)
 

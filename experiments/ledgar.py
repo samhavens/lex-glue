@@ -245,6 +245,11 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
+    
+    # GPT2 is whack
+    if not hasattr(tokenizer, "pad_token") or not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+        model.config.pad_token_id = model.config.eos_token_id
 
     # Preprocessing the datasets
     # Padding strategy

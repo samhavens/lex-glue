@@ -13,7 +13,7 @@ import datasets
 import numpy as np
 from datasets import load_dataset
 from sklearn.metrics import f1_score
-from trainer import MultilabelTrainer
+from experiments.trainer import MultilabelTrainer
 from scipy.special import expit
 from torch import nn
 import glob
