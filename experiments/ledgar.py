@@ -11,7 +11,7 @@ from typing import Optional
 
 import datasets
 from datasets import load_dataset
-from sklearn.metrics import f1_score
+from sklearn.metrics import accuracy_score, f1_score
 import numpy as np
 import glob
 import shutil
@@ -135,6 +135,7 @@ class ModelArguments:
     )
 
 
+
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -224,6 +225,7 @@ def main():
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
+        use_cache=False if training_args.gradient_checkpointing else None,
     )
 
     if config.model_type == 'big_bird':
@@ -246,7 +248,8 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
     
-    # GPT2 is whack
+    # GPT2 does not have a PAD token, and that breaks things
+    # this lets GPT2 be used in this script
     if not hasattr(tokenizer, "pad_token") or not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = model.config.eos_token_id
@@ -314,7 +317,8 @@ def main():
         preds = np.argmax(logits, axis=1)
         macro_f1 = f1_score(y_true=p.label_ids, y_pred=preds, average='macro', zero_division=0)
         micro_f1 = f1_score(y_true=p.label_ids, y_pred=preds, average='micro', zero_division=0)
-        return {'macro-f1': macro_f1, 'micro-f1': micro_f1}
+        accuracy = accuracy_score(y_true=p.label_ids, y_pred=preds, normalize=True)
+        return {'macro-f1': macro_f1, 'micro-f1': micro_f1, 'accuracy': accuracy}
 
     # Data collator will default to DataCollatorWithPadding, so we change it if we already did the padding.
     if data_args.pad_to_max_length:
@@ -333,7 +337,7 @@ def main():
         compute_metrics=compute_metrics,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
     )
 
     # Training
