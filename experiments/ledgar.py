@@ -140,9 +140,17 @@ def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
-
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # allow user to pass a yaml file with these configs
+    maybe_yaml, args = sys.argv[1], sys.argv[2:]
+    if maybe_yaml.endswith("yaml"):
+        if len(args):
+            raise ValueError("Either use YAML or CLI args, not both")
+        model_args, data_args, training_args = parser.parse_yaml_file(maybe_yaml)
+    else:
+        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
 
     # Setup distant debugging if needed
     if data_args.server_ip and data_args.server_port:
@@ -231,8 +239,10 @@ def main():
     if config.model_type == 'big_bird':
         config.attention_type = 'original_full'
 
+    tokenizer_name = model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path
+
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+        tokenizer_name,
         do_lower_case=model_args.do_lower_case,
         cache_dir=model_args.cache_dir,
         use_fast=model_args.use_fast_tokenizer,
@@ -250,7 +260,7 @@ def main():
     
     # GPT2 does not have a PAD token, and that breaks things
     # this lets GPT2 be used in this script
-    if not hasattr(tokenizer, "pad_token") or not tokenizer.pad_token:
+    if "gpt2" in tokenizer_name or tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         model.config.pad_token_id = model.config.eos_token_id
 
@@ -259,9 +269,8 @@ def main():
     if data_args.pad_to_max_length:
         padding = "max_length"
     else:
-        # True or 'longest': pad to the longest sequence in the batch
-        # (no padding is applied if batch size is 1)
-        padding = True
+        # add later
+        padding = False
 
     def preprocess_function(examples):
         # Tokenize the texts
