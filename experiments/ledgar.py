@@ -259,8 +259,9 @@ def main():
     if data_args.pad_to_max_length:
         padding = "max_length"
     else:
-        # We will pad later, dynamically at batch creation, to the max sequence length in each batch
-        padding = False
+        # True or 'longest': pad to the longest sequence in the batch
+        # (no padding is applied if batch size is 1)
+        padding = True
 
     def preprocess_function(examples):
         # Tokenize the texts
