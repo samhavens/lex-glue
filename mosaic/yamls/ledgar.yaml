@@ -15,7 +15,7 @@ command: >-
   cd lex-glue;
   pip install -r requirements.txt;
   cd mosaic;
-  composer run_job.py /mnt/config/parameters.yaml
+  composer tasks.py /mnt/config/parameters.yaml
 optimization_level: 0
 parameters:
   task: &task ledgar

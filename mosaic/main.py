@@ -9,10 +9,12 @@ from mcli.api.runs import create_run
 
 
 class FineTuneRun:
-    """Encapsulates a fine-tuning MCloud Run.
-    Tasks should subclass FineTuneRun and implement the get_config() method.
+    """Encapsulates a fine-tuning MCloud Run
+
+    Configs come from a file (haven't implemented dict)
+
     Args:
-        config (dict|RunConfig, Optional): MCloud config for the fine-tune run
+        config (dict|RunConfig): MCloud config for the fine-tune run
 
     ```python
     ledgar_finetune = FineTuneRun(RunConfig(
@@ -20,6 +22,9 @@ class FineTuneRun:
         image="mosaicml/composer:latest",
         ...
     ))
+    # alternatively
+    # ledgar_finetune = FineTuneRun.from_file("ledgar.yaml")
+    ledgar_finetune.create_run()
     ```
     """
 
@@ -46,14 +51,6 @@ class FineTuneRun:
         else:
             raise TypeError("FineTuneRun.from_file accepts str or Path objects")
 
-
-    @property
-    def job_name(self) -> str:
-        """Config `name`, falls back to `run_name`, then defaults to class name."""
-        if self.config.name is not None:
-            return self.config.name
-        return self.config.run_name if self.config.run_name else self.__class__.__name__
-
     def create_run(self, future: bool = False) -> Union[Run, Future]:
         return create_run(run=self.config, future=future)
 
@@ -72,3 +69,4 @@ if __name__ == "__main__":
     for run_conf in run_configs:
         run = run_conf.create_run()
         print(f'Launching run {run.name} with id {run.run_uid}')  # type: ignore
+        # do we want to just exit here? or show the status of all the runs?

@@ -3,6 +3,7 @@
 
 # """Contains lex-GLUE job objects for ..."""
 import os
+import sys
 from typing import cast
 from omegaconf import OmegaConf as om, DictConfig
 
@@ -190,3 +191,13 @@ def main(task_name: str, cfg: DictConfig) -> None:
 
     print("Starting training...")
     trainer.fit()
+
+
+if __name__ == '__main__':
+    yaml_path, args_list = sys.argv[1], sys.argv[2:]
+    with open(yaml_path) as f:
+        yaml_cfg = om.load(f)
+    cli_cfg = om.from_cli(args_list)
+    cfg: DictConfig = om.merge(yaml_cfg, cli_cfg)  # type: ignore
+    task = cfg.task
+    main(task, cfg)
