@@ -1,3 +1,8 @@
+# Copyright 2022 MosaicML Composer authors
+# SPDX-License-Identifier: Apache-2.0
+
+"""The main runner. Spawns MCloud runs for each subtask"""
+
 from concurrent.futures import Future
 from pathlib import Path
 import sys
