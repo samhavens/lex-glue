@@ -2,744 +2,191 @@
 # # SPDX-License-Identifier: Apache-2.0
 
 # """Contains lex-GLUE job objects for ..."""
-import multiprocessing as mp
-from typing import Any, Dict, List, Optional, Union, cast
+import os
+from typing import cast
+from omegaconf import OmegaConf as om, DictConfig
 
-import torch
 from torch.utils.data import DataLoader
+from transformers import AutoConfig
 
-from composer.core import Callback
-from composer.core.evaluator import Evaluator
+from composer import Trainer, algorithms
 from composer.core.types import Dataset
-from composer.loggers import LoggerDestination
-from composer.optim import ComposerScheduler, DecoupledAdamW
-
-from composer.trainer.trainer import Trainer
+from composer.optim import DecoupledAdamW
+from composer.optim.scheduler import (ConstantWithWarmupScheduler,
+                                      CosineAnnealingWithWarmupScheduler,
+                                      LinearWithWarmupScheduler)
 from composer.utils import dist, reproducibility
+from composer.callbacks import LRMonitor, MemoryMonitor, SpeedMonitor
+from composer.loggers import WandBLogger
+import wandb
 
 from mosaic.data import create_lexglue_dataset
-from mosaic.labels import *
+from mosaic.labels import TASK_NAME_TO_NUM_LABELS
+from mosaic.models.hf_model import get_huggingface_model
 
 
-def _build_dataloader(dataset, **kwargs):
+def build_dataloader(dataset, device_batch_size, **kwargs):
     import transformers
     dataset = cast(Dataset, dataset)
 
     return DataLoader(
         dataset=dataset,
+        batch_size=device_batch_size,
         sampler=dist.get_sampler(dataset, drop_last=False, shuffle=False),
         collate_fn=transformers.default_data_collator,
         **kwargs,
     )
 
 
-Metrics = Dict[str, Dict[str, Any]]
-
-
-TASK_NAME_TO_NUM_LABELS = {
-    'case_hold': 5,
-    'ecthr_a': len(ECTHR_ARTICLES),
-    'ecthr_b': len(ECTHR_ARTICLES),
-    'eurlex': len(EUROVOC_CONCEPTS),
-    'ledgar': len(LEDGAR_CATEGORIES),
-    'scotus': len(SCDB_ISSUE_AREAS),
-    'unfair_tos': len(UNFAIR_CATEGORIES),
-}
-
-# GLUE code unchanged below
-# need to modify to not start a job, but to kick off an MCLI run
-# use mcli sdk https://internal.mcli.docs.mosaicml.com/python/hello_world.html
-# see DM with Daniel
-
-class FineTuneJob:
-    """Encapsulates a fine-tuning job.
-    Tasks should subclass FineTuneJob and implement the
-    get_trainer() method.
-    Args:
-        name (str, optional): job name. Defaults to the class name.
-        load_path (str, optional): path to load checkpoints. Default: None
-        save_folder (str, optional): path to save checkpoints. Default: None
-        kwargs (dict, optional): additional arguments passed available to the Trainer.
-    """
-
-    def __init__(
-        self,
-        job_name: Optional[str] = None,
-        load_path: Optional[str] = None,
-        save_folder: Optional[str] = None,
-        seed: int = 42,
-        **kwargs,
-    ):
-        reproducibility.seed_all(seed)
-        self._job_name = job_name
-        self.seed = seed
-        self.load_path = load_path
-        self.save_folder = save_folder
-        self.kwargs = kwargs
-
-    def get_trainer(self, device: Optional[Union[str, Device]]) -> Trainer:
-        """Returns the trainer for the job."""
-        raise NotImplementedError
-
-    def print_metrics(self, metrics: Metrics):
-        """Prints fine-tuning results."""
-        job_name = self.job_name
-
-        print(f'Results for {job_name}:')
-        print('-' * (12 + len(job_name)))
-        for eval, metric in metrics.items():
-            for metric_name, value in metric.items():
-                print(f'{eval}: {metric_name}, {value*100:.2f}')
-        print('-' * (12 + len(job_name)))
-
-    @property
-    def job_name(self) -> str:
-        """Job name, defaults to class name."""
-        if self._job_name is not None:
-            return self._job_name
-        return self.__class__.__name__
-
-    def run(self, gpu_queue: Optional[mp.Queue] = None) -> Dict[str, Any]:
-        """Trains the model, optionally pulling a GPU id from the queue.
-        Returns a dict with keys:
-        * 'checkpoints': list of saved_checkpoints, if any,
-        * 'metrics': nested dict of results, accessed by
-                     dataset and metric name, e.g.
-                     ``metrics['glue_mnli']['Accuracy']``.
-        """
-        gpu_id = gpu_queue.get() if gpu_queue is not None else 0
-
-        print(f'Running {self.job_name} on GPU {gpu_id}')
-
-        try:
-            gpu = DeviceGPU(gpu_id)
-            trainer = self.get_trainer(device=gpu)
-
-            trainer.fit()
-
-            collected_metrics: Dict[str, Dict[str, Any]] = {}
-            for eval_name, metrics in trainer.state.eval_metrics.items():
-                collected_metrics[eval_name] = {
-                    name: metric.compute().cpu().numpy() for name, metric in metrics.items()
-                }
-
-            trainer.close()
-            self.print_metrics(collected_metrics)
-        finally:
-            # release the GPU for other jobs
-            if gpu_queue:
-                print(f'Releasing GPU {gpu_id}')
-                gpu_queue.put(gpu_id)
-
-        return {'checkpoints': trainer.saved_checkpoints, 'metrics': collected_metrics, 'job_name': self.job_name}
-
-
-class GlueClassificationJob(FineTuneJob):
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        tokenizer_name: str,
-        job_name: Optional[str] = None,
-        seed: int = 42,
-        task_name: Optional[str] = None,
-        num_labels: Optional[int] = -1,
-        eval_interval: str = '1000ba',
-        scheduler: Optional[ComposerScheduler] = None,
-        max_sequence_length: Optional[int] = 256,
-        max_duration: Optional[str] = '3ep',
-        batch_size: Optional[int] = 32,
-        load_path: Optional[str] = None,
-        save_folder: Optional[str] = None,
-        loggers: Optional[List[LoggerDestination]] = None,
-        callbacks: Optional[List[Callback]] = None,
-        precision: Optional[str] = None,
-        **kwargs,
-    ):
-        if task_name is None:
-            raise ValueError(
-                "GlueClassificationJob should not be instantiated directly. Please instantiate a specific glue job type instead (e.g. MNLIJob)."
-            )
-        super().__init__(job_name, load_path, save_folder, seed, **kwargs)
-
-        self.task_name = task_name
-
-        self.num_labels = num_labels
-        self.eval_interval = eval_interval
-        self.tokenizer_name = tokenizer_name
-        self.model = model
-
-        self.scheduler = scheduler
-
-        self.max_sequence_length = max_sequence_length
-        self.max_duration = max_duration
-        self.batch_size = batch_size
-        self.loggers = loggers
-        self.callbacks = callbacks
-        self.precision = precision
-
-        # These will be set by the subclasses for specific GLUE tasks
-        self.train_dataloader = None
-        self.evaluators = None
-        self.optimizer = None
-
-    def get_trainer(self, device: Optional[Union[Device, str]] = None):
-        return Trainer(model=self.model,
-                       optimizers=self.optimizer,
-                       schedulers=self.scheduler,
-                       train_dataloader=self.train_dataloader,
-                       eval_dataloader=self.evaluators,
-                       eval_interval=self.eval_interval,
-                       load_path=self.load_path,
-                       save_folder=self.save_folder,
-                       max_duration=self.max_duration,
-                       seed=self.seed,
-                       grad_accum='auto',
-                       load_weights_only=True,
-                       load_strict_model_weights=False,
-                       loggers=self.loggers,
-                       callbacks=self.callbacks,
-                       python_log_level='ERROR',
-                       run_name=self.job_name,
-                       load_ignore_keys=['state/model/model.classifier*'],
-                       precision=self.precision,
-                       device=device,
-                       progress_bar=True,
-                       log_to_console=False,
-                       **self.kwargs)
-
-
-class MNLIJob(GlueClassificationJob):
-    """MNLI."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        tokenizer_name: str,
-        job_name: Optional[str] = None,
-        seed: int = 42,
-        eval_interval: str = '2300ba',
-        scheduler: Optional[ComposerScheduler] = None,
-        max_sequence_length: Optional[int] = 256,
-        max_duration: Optional[str] = '3ep',
-        batch_size: Optional[int] = 48,
-        load_path: Optional[str] = None,
-        save_folder: Optional[str] = None,
-        loggers: Optional[List[LoggerDestination]] = None,
-        callbacks: Optional[List[Callback]] = None,
-        precision: Optional[str] = None,
-        **kwargs,
-    ):
-        super().__init__(model=model,
-                         tokenizer_name=tokenizer_name,
-                         job_name=job_name,
-                         seed=seed,
-                         task_name='mnli',
-                         num_labels=3,
-                         eval_interval=eval_interval,
-                         scheduler=scheduler,
-                         max_sequence_length=max_sequence_length,
-                         max_duration=max_duration,
-                         batch_size=batch_size,
-                         load_path=load_path,
-                         save_folder=save_folder,
-                         loggers=loggers,
-                         callbacks=callbacks,
-                         precision=precision,
-                         **kwargs)
-
-        self.optimizer = DecoupledAdamW(self.model.parameters(),
-                                        lr=5.0e-5,
-                                        betas=(0.9, 0.98),
-                                        eps=1.0e-06,
-                                        weight_decay=5.0e-06)
-
-        dataset_kwargs = {
-            'task': self.task_name,
-            'tokenizer_name': self.tokenizer_name,
-            'max_seq_length': self.max_sequence_length,
-        }
-
-        dataloader_kwargs = {
-            'batch_size': self.batch_size,
-            'num_workers': 0,
-            'shuffle': False,
-            'drop_last': False,
-        }
-        train_dataset = create_lexglue_dataset(split='train', **dataset_kwargs)
-        self.train_dataloader = _build_dataloader(train_dataset, **dataloader_kwargs)
-        mnli_eval_dataset = create_lexglue_dataset(split='validation_matched', **dataset_kwargs)
-        mnli_eval_mismatched_dataset = create_lexglue_dataset(split='validation_mismatched', **dataset_kwargs)
-        mnli_evaluator = Evaluator(label='glue_mnli',
-                                   dataloader=_build_dataloader(mnli_eval_dataset, **dataloader_kwargs),
-                                   metric_names=['Accuracy'])
-        mnli_evaluator_mismatched = Evaluator(label='glue_mnli_mismatched',
-                                              dataloader=_build_dataloader(mnli_eval_mismatched_dataset,
-                                                                           **dataloader_kwargs),
-                                              metric_names=['Accuracy'])
-        self.evaluators = [mnli_evaluator, mnli_evaluator_mismatched]
-
-
-class RTEJob(GlueClassificationJob):
-    """RTE."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        tokenizer_name: str,
-        job_name: Optional[str] = None,
-        seed: int = 42,
-        eval_interval: str = '100ba',
-        scheduler: Optional[ComposerScheduler] = None,
-        max_sequence_length: Optional[int] = 256,
-        max_duration: Optional[str] = '3ep',
-        batch_size: Optional[int] = 16,
-        load_path: Optional[str] = None,
-        save_folder: Optional[str] = None,
-        loggers: Optional[List[LoggerDestination]] = None,
-        callbacks: Optional[List[Callback]] = None,
-        precision: Optional[str] = None,
-        **kwargs,
-    ):
-        super().__init__(model=model,
-                         tokenizer_name=tokenizer_name,
-                         job_name=job_name,
-                         seed=seed,
-                         task_name='rte',
-                         num_labels=2,
-                         eval_interval=eval_interval,
-                         scheduler=scheduler,
-                         max_sequence_length=max_sequence_length,
-                         max_duration=max_duration,
-                         batch_size=batch_size,
-                         load_path=load_path,
-                         save_folder=save_folder,
-                         loggers=loggers,
-                         callbacks=callbacks,
-                         precision=precision,
-                         **kwargs)
-
-        self.optimizer = DecoupledAdamW(self.model.parameters(),
-                                        lr=1.0e-5,
-                                        betas=(0.9, 0.98),
-                                        eps=1.0e-06,
-                                        weight_decay=1.0e-5)
-
-        dataset_kwargs = {
-            'task': self.task_name,
-            'tokenizer_name': self.tokenizer_name,
-            'max_seq_length': self.max_sequence_length,
-        }
-
-        dataloader_kwargs = {
-            'batch_size': self.batch_size,
-            'num_workers': 0,
-            'shuffle': False,
-            'drop_last': False,
-        }
-        train_dataset = create_lexglue_dataset(split='train', **dataset_kwargs)
-        self.train_dataloader = _build_dataloader(train_dataset, **dataloader_kwargs)
-        rte_eval_dataset = create_lexglue_dataset(split='validation', **dataset_kwargs)
-        rte_evaluator = Evaluator(label='glue_rte',
-                                  dataloader=_build_dataloader(rte_eval_dataset, **dataloader_kwargs),
-                                  metric_names=['Accuracy'])
-        self.evaluators = [rte_evaluator]
-
-
-class QQPJob(GlueClassificationJob):
-    """QQP."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        tokenizer_name: str,
-        job_name: Optional[str] = None,
-        seed: int = 42,
-        eval_interval: str = '2000ba',
-        scheduler: Optional[ComposerScheduler] = None,
-        max_sequence_length: Optional[int] = 256,
-        max_duration: Optional[str] = '5ep',
-        batch_size: Optional[int] = 16,
-        load_path: Optional[str] = None,
-        save_folder: Optional[str] = None,
-        loggers: Optional[List[LoggerDestination]] = None,
-        callbacks: Optional[List[Callback]] = None,
-        precision: Optional[str] = None,
-        **kwargs,
-    ):
-        super().__init__(model=model,
-                         tokenizer_name=tokenizer_name,
-                         job_name=job_name,
-                         seed=seed,
-                         task_name='qqp',
-                         num_labels=2,
-                         eval_interval=eval_interval,
-                         scheduler=scheduler,
-                         max_sequence_length=max_sequence_length,
-                         max_duration=max_duration,
-                         batch_size=batch_size,
-                         load_path=load_path,
-                         save_folder=save_folder,
-                         loggers=loggers,
-                         callbacks=callbacks,
-                         precision=precision,
-                         **kwargs)
-
-        self.optimizer = DecoupledAdamW(self.model.parameters(),
-                                        lr=3.0e-5,
-                                        betas=(0.9, 0.98),
-                                        eps=1.0e-06,
-                                        weight_decay=3.0e-6)
-
-        dataset_kwargs = {
-            'task': self.task_name,
-            'tokenizer_name': self.tokenizer_name,
-            'max_seq_length': self.max_sequence_length,
-        }
-
-        dataloader_kwargs = {
-            'batch_size': self.batch_size,
-            'num_workers': 0,
-            'shuffle': False,
-            'drop_last': False,
-        }
-        train_dataset = create_lexglue_dataset(split='train', **dataset_kwargs)
-        self.train_dataloader = _build_dataloader(train_dataset, **dataloader_kwargs)
-        qqp_eval_dataset = create_lexglue_dataset(split='validation', **dataset_kwargs)
-        qqp_evaluator = Evaluator(label='glue_qqp',
-                                  dataloader=_build_dataloader(qqp_eval_dataset, **dataloader_kwargs),
-                                  metric_names=['Accuracy', 'BinaryF1Score'])
-        self.evaluators = [qqp_evaluator]
-
-
-class COLAJob(GlueClassificationJob):
-    """COLA."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        tokenizer_name: str,
-        job_name: Optional[str] = None,
-        seed: int = 42,
-        eval_interval: str = '250ba',
-        scheduler: Optional[ComposerScheduler] = None,
-        max_sequence_length: Optional[int] = 256,
-        max_duration: Optional[str] = '10ep',
-        batch_size: Optional[int] = 32,
-        load_path: Optional[str] = None,
-        save_folder: Optional[str] = None,
-        loggers: Optional[List[LoggerDestination]] = None,
-        callbacks: Optional[List[Callback]] = None,
-        precision: Optional[str] = None,
-        **kwargs,
-    ):
-        super().__init__(model=model,
-                         tokenizer_name=tokenizer_name,
-                         job_name=job_name,
-                         seed=seed,
-                         task_name='cola',
-                         num_labels=2,
-                         eval_interval=eval_interval,
-                         scheduler=scheduler,
-                         max_sequence_length=max_sequence_length,
-                         max_duration=max_duration,
-                         batch_size=batch_size,
-                         load_path=load_path,
-                         save_folder=save_folder,
-                         loggers=loggers,
-                         callbacks=callbacks,
-                         precision=precision,
-                         **kwargs)
-
-        self.optimizer = DecoupledAdamW(self.model.parameters(),
-                                        lr=5.0e-5,
-                                        betas=(0.9, 0.98),
-                                        eps=1.0e-06,
-                                        weight_decay=5.0e-6)
-
-        dataset_kwargs = {
-            'task': self.task_name,
-            'tokenizer_name': self.tokenizer_name,
-            'max_seq_length': self.max_sequence_length,
-        }
-
-        dataloader_kwargs = {
-            'batch_size': self.batch_size,
-            'num_workers': 0,
-            'shuffle': False,
-            'drop_last': False,
-        }
-        train_dataset = create_lexglue_dataset(split='train', **dataset_kwargs)
-        self.train_dataloader = _build_dataloader(train_dataset, **dataloader_kwargs)
-        cola_eval_dataset = create_lexglue_dataset(split='validation', **dataset_kwargs)
-        cola_evaluator = Evaluator(label='glue_cola',
-                                   dataloader=_build_dataloader(cola_eval_dataset, **dataloader_kwargs),
-                                   metric_names=['MatthewsCorrCoef'])
-        self.evaluators = [cola_evaluator]
-
-
-class MRPCJob(GlueClassificationJob):
-    """MRPC."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        tokenizer_name: str,
-        job_name: Optional[str] = None,
-        seed: int = 42,
-        eval_interval: str = '100ba',
-        scheduler: Optional[ComposerScheduler] = None,
-        max_sequence_length: Optional[int] = 256,
-        max_duration: Optional[str] = '10ep',
-        batch_size: Optional[int] = 32,
-        load_path: Optional[str] = None,
-        save_folder: Optional[str] = None,
-        loggers: Optional[List[LoggerDestination]] = None,
-        callbacks: Optional[List[Callback]] = None,
-        precision: Optional[str] = None,
-        **kwargs,
-    ):
-        super().__init__(model=model,
-                         tokenizer_name=tokenizer_name,
-                         job_name=job_name,
-                         seed=seed,
-                         task_name='mrpc',
-                         num_labels=2,
-                         eval_interval=eval_interval,
-                         scheduler=scheduler,
-                         max_sequence_length=max_sequence_length,
-                         max_duration=max_duration,
-                         batch_size=batch_size,
-                         load_path=load_path,
-                         save_folder=save_folder,
-                         loggers=loggers,
-                         callbacks=callbacks,
-                         precision=precision,
-                         **kwargs)
-
-        self.optimizer = DecoupledAdamW(self.model.parameters(),
-                                        lr=8.0e-5,
-                                        betas=(0.9, 0.98),
-                                        eps=1.0e-06,
-                                        weight_decay=8.0e-6)
-
-        dataset_kwargs = {
-            'task': self.task_name,
-            'tokenizer_name': self.tokenizer_name,
-            'max_seq_length': self.max_sequence_length,
-        }
-
-        dataloader_kwargs = {
-            'batch_size': self.batch_size,
-            'num_workers': 0,
-            'shuffle': False,
-            'drop_last': False,
-        }
-        train_dataset = create_lexglue_dataset(split='train', **dataset_kwargs)
-        self.train_dataloader = _build_dataloader(train_dataset, **dataloader_kwargs)
-        mrpc_eval_dataset = create_lexglue_dataset(split='validation', **dataset_kwargs)
-        mrpc_evaluator = Evaluator(label='glue_mrpc',
-                                   dataloader=_build_dataloader(mrpc_eval_dataset, **dataloader_kwargs),
-                                   metric_names=['Accuracy', 'BinaryF1Score'])
-        self.evaluators = [mrpc_evaluator]
-
-
-class QNLIJob(GlueClassificationJob):
-    """QNLI."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        tokenizer_name: str,
-        job_name: Optional[str] = None,
-        seed: int = 42,
-        eval_interval: str = '1000ba',
-        scheduler: Optional[ComposerScheduler] = None,
-        max_sequence_length: Optional[int] = 256,
-        max_duration: Optional[str] = '10ep',
-        batch_size: Optional[int] = 16,
-        load_path: Optional[str] = None,
-        save_folder: Optional[str] = None,
-        loggers: Optional[List[LoggerDestination]] = None,
-        callbacks: Optional[List[Callback]] = None,
-        precision: Optional[str] = None,
-        **kwargs,
-    ):
-        super().__init__(model=model,
-                         tokenizer_name=tokenizer_name,
-                         job_name=job_name,
-                         seed=seed,
-                         task_name='qnli',
-                         num_labels=2,
-                         eval_interval=eval_interval,
-                         scheduler=scheduler,
-                         max_sequence_length=max_sequence_length,
-                         max_duration=max_duration,
-                         batch_size=batch_size,
-                         load_path=load_path,
-                         save_folder=save_folder,
-                         loggers=loggers,
-                         callbacks=callbacks,
-                         precision=precision,
-                         **kwargs)
-
-        self.optimizer = DecoupledAdamW(self.model.parameters(),
-                                        lr=1.0e-5,
-                                        betas=(0.9, 0.98),
-                                        eps=1.0e-06,
-                                        weight_decay=1.0e-6)
-
-        dataset_kwargs = {
-            'task': self.task_name,
-            'tokenizer_name': self.tokenizer_name,
-            'max_seq_length': self.max_sequence_length,
-        }
-
-        dataloader_kwargs = {
-            'batch_size': self.batch_size,
-            'num_workers': 0,
-            'shuffle': False,
-            'drop_last': False,
-        }
-        train_dataset = create_lexglue_dataset(split='train', **dataset_kwargs)
-        self.train_dataloader = _build_dataloader(train_dataset, **dataloader_kwargs)
-        qnli_eval_dataset = create_lexglue_dataset(split='validation', **dataset_kwargs)
-        qnli_evaluator = Evaluator(label='glue_qnli',
-                                   dataloader=_build_dataloader(qnli_eval_dataset, **dataloader_kwargs),
-                                   metric_names=['Accuracy'])
-        self.evaluators = [qnli_evaluator]
-
-
-class SST2Job(GlueClassificationJob):
-    """SST2."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        tokenizer_name: str,
-        job_name: Optional[str] = None,
-        seed: int = 42,
-        eval_interval: str = '500ba',
-        scheduler: Optional[ComposerScheduler] = None,
-        max_sequence_length: Optional[int] = 256,
-        max_duration: Optional[str] = '3ep',
-        batch_size: Optional[int] = 16,
-        load_path: Optional[str] = None,
-        save_folder: Optional[str] = None,
-        loggers: Optional[List[LoggerDestination]] = None,
-        callbacks: Optional[List[Callback]] = None,
-        precision: Optional[str] = None,
-        **kwargs,
-    ):
-        super().__init__(model=model,
-                         tokenizer_name=tokenizer_name,
-                         job_name=job_name,
-                         seed=seed,
-                         task_name='sst2',
-                         num_labels=2,
-                         eval_interval=eval_interval,
-                         scheduler=scheduler,
-                         max_sequence_length=max_sequence_length,
-                         max_duration=max_duration,
-                         batch_size=batch_size,
-                         load_path=load_path,
-                         save_folder=save_folder,
-                         loggers=loggers,
-                         callbacks=callbacks,
-                         precision=precision,
-                         **kwargs)
-
-        self.optimizer = DecoupledAdamW(self.model.parameters(),
-                                        lr=3.0e-5,
-                                        betas=(0.9, 0.98),
-                                        eps=1.0e-06,
-                                        weight_decay=3.0e-6)
-
-        dataset_kwargs = {
-            'task': self.task_name,
-            'tokenizer_name': self.tokenizer_name,
-            'max_seq_length': self.max_sequence_length,
-        }
-
-        dataloader_kwargs = {
-            'batch_size': self.batch_size,
-            'num_workers': 0,
-            'shuffle': False,
-            'drop_last': False,
-        }
-        train_dataset = create_lexglue_dataset(split='train', **dataset_kwargs)
-        self.train_dataloader = _build_dataloader(train_dataset, **dataloader_kwargs)
-        sst2_eval_dataset = create_lexglue_dataset(split='validation', **dataset_kwargs)
-        sst2_evaluator = Evaluator(label='glue_sst2',
-                                   dataloader=_build_dataloader(sst2_eval_dataset, **dataloader_kwargs),
-                                   metric_names=['Accuracy'])
-        self.evaluators = [sst2_evaluator]
-
-
-class STSBJob(GlueClassificationJob):
-    """STSB."""
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        tokenizer_name: str,
-        job_name: Optional[str] = None,
-        seed: int = 42,
-        eval_interval: str = '200ba',
-        scheduler: Optional[ComposerScheduler] = None,
-        max_sequence_length: Optional[int] = 256,
-        max_duration: Optional[str] = '10ep',
-        batch_size: Optional[int] = 32,
-        load_path: Optional[str] = None,
-        save_folder: Optional[str] = None,
-        loggers: Optional[List[LoggerDestination]] = None,
-        callbacks: Optional[List[Callback]] = None,
-        precision: Optional[str] = None,
-        **kwargs,
-    ):
-        super().__init__(model=model,
-                         tokenizer_name=tokenizer_name,
-                         job_name=job_name,
-                         seed=seed,
-                         task_name='stsb',
-                         num_labels=1,
-                         eval_interval=eval_interval,
-                         scheduler=scheduler,
-                         max_sequence_length=max_sequence_length,
-                         max_duration=max_duration,
-                         batch_size=batch_size,
-                         load_path=load_path,
-                         save_folder=save_folder,
-                         loggers=loggers,
-                         callbacks=callbacks,
-                         precision=precision,
-                         **kwargs)
-
-        self.optimizer = DecoupledAdamW(self.model.parameters(),
-                                        lr=3.0e-5,
-                                        betas=(0.9, 0.98),
-                                        eps=1.0e-06,
-                                        weight_decay=3.0e-6)
-
-        dataset_kwargs = {
-            'task': self.task_name,
-            'tokenizer_name': self.tokenizer_name,
-            'max_seq_length': self.max_sequence_length,
-        }
-
-        dataloader_kwargs = {
-            'batch_size': self.batch_size,
-            'num_workers': 0,
-            'shuffle': False,
-            'drop_last': False,
-        }
-        train_dataset = create_lexglue_dataset(split='train', **dataset_kwargs)
-        self.train_dataloader = _build_dataloader(train_dataset, **dataloader_kwargs)
-        stsb_eval_dataset = create_lexglue_dataset(split='validation', **dataset_kwargs)
-        stsb_evaluator = Evaluator(label='glue_stsb',
-                                   dataloader=_build_dataloader(stsb_eval_dataset, **dataloader_kwargs),
-                                   metric_names=['SpearmanCorrCoef'])
-        self.evaluators = [stsb_evaluator]
-
-        # Hardcoded for STSB due to a bug (Can be removed once torchmetrics fixes https://github.com/Lightning-AI/metrics/issues/1294)
-        self.precision = 'fp32'
+def build_logger(name, kwargs):
+    if name == 'wandb':
+        return WandBLogger(**kwargs)
+    else:
+        raise ValueError(f'Not sure how to build logger: {name}')
+
+
+def build_callback(name, kwargs):
+    if name == 'lr_monitor':
+        return LRMonitor()
+    elif name == 'memory_monitor':
+        return MemoryMonitor()
+    elif name == 'speed_monitor':
+        return SpeedMonitor(window_size=kwargs.get('window_size', 1))
+    else:
+        raise ValueError(f'Not sure how to build callback: {name}')
+
+
+def build_algorithm(name, kwargs):
+    if name == 'fused_layernorm':
+        return algorithms.FusedLayerNorm(**kwargs)
+    else:
+        raise ValueError(f'Not sure how to build algorithm: {name}')
+
+
+def build_optimizer(cfg, model):
+    if cfg.name == 'decoupled_adamw':
+        return DecoupledAdamW(
+            model.parameters(),
+            lr=cfg.lr,
+            betas=cfg.betas,
+            eps=cfg.eps,
+            weight_decay=cfg.weight_decay
+        )
+    else:
+        raise ValueError(f'Not sure how to build optimizer: {cfg.name}')
+
+def build_scheduler(cfg):
+    if cfg.name == 'constant_with_warmup':
+        return ConstantWithWarmupScheduler(
+            t_warmup=cfg.t_warmup)
+    elif cfg.name == 'linear_decay_with_warmup':
+        return LinearWithWarmupScheduler(
+            t_warmup=cfg.t_warmup,
+            alpha_f=cfg.alpha_f
+        )
+    elif cfg.name == 'cosine_with_warmup':
+        return CosineAnnealingWithWarmupScheduler(
+            t_warmup=cfg.t_warmup,
+            alpha_f=cfg.alpha_f)
+    else:
+        raise ValueError(f'Not sure how to build scheduler: {cfg.name}')
+
+
+def build_model(cfg, task_name: str):
+    config = AutoConfig.from_pretrained(
+        cfg.config_name if cfg.config_name else cfg.model_name_or_path,
+        num_labels=TASK_NAME_TO_NUM_LABELS[task_name],
+        finetuning_task=task_name,
+        cache_dir=cfg.cache_dir if cfg.cache_dir else None,
+        revision=cfg.model_revision if cfg.model_revision else None,
+        use_auth_token=True if cfg.use_auth_token else None,
+        use_cache=False if cfg.gradient_checkpointing else None,
+    )
+    return get_huggingface_model(cfg, config)
+
+
+def main(task_name: str, cfg: DictConfig) -> None:
+    print("Training using config: ")
+    print(om.to_yaml(cfg))
+    reproducibility.seed_all(cfg.seed)
+
+    # Build Model
+    print('Initializing model...')
+    model = build_model(cfg.model, task_name)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f'{n_params=:.4e}')
+
+    # Get batch size info
+    device_train_batch_size = cfg.global_train_batch_size // dist.get_world_size()
+    device_eval_batch_size = cfg.get('global_eval_batch_size', cfg.global_train_batch_size) // dist.get_world_size()
+
+    # Dataloaders
+    print("Building eval loader...")
+    eval_dataset = create_lexglue_dataset(task_name, model.tokenizer, split="eval", max_seq_length=cfg.max_sequence_length)
+    eval_loader = build_dataloader(eval_dataset, device_eval_batch_size)
+    print("Building train loader...")
+    train_dataset = create_lexglue_dataset(task_name, model.tokenizer, split="train", max_seq_length=cfg.max_sequence_length)
+    train_loader = build_dataloader(train_dataset, device_train_batch_size)
+
+    # Optimizer
+    optimizer = build_optimizer(cfg.optimizer, model)
+    
+    # Scheduler
+    scheduler = build_scheduler(cfg.scheduler)
+
+    # Loggers
+    loggers = [build_logger(name, logger_cfg) for name, logger_cfg in cfg.get('loggers', {}).items()]
+
+    # Callbacks
+    callbacks = [build_callback(name, callback_cfg) for name, callback_cfg in cfg.get('callbacks', {}).items()]
+
+    # Algorithms
+    algorithms = [build_algorithm(name, algorithm_cfg) for name, algorithm_cfg in cfg.get('algorithms', {}).items()]
+
+    if 'run_name' in cfg:
+        run_name = cfg['run_name']
+    else:
+        run_name = os.environ['COMPOSER_RUN_NAME']
+
+    # Build the Trainer
+    trainer = Trainer(
+        run_name=run_name,
+        seed=cfg.seed,
+        model=model,
+        algorithms=algorithms,
+        train_dataloader=train_loader,
+        eval_dataloader=eval_loader,
+        train_subset_num_batches=cfg.get('train_subset_num_batches', -1),
+        eval_subset_num_batches=cfg.get('eval_subset_num_batches', -1),
+        optimizers=optimizer,
+        schedulers=scheduler,
+        max_duration=cfg.max_duration,
+        eval_interval=cfg.eval_interval,
+        progress_bar=cfg.progress_bar,
+        log_to_console=cfg.log_to_console,
+        loggers=loggers,
+        callbacks=callbacks,
+        precision=cfg.precision,
+        device=cfg.get('device', None),
+        grad_clip_norm=cfg.grad_clip_norm,
+        grad_accum=cfg.get('grad_accum', 'auto'),
+        save_folder=cfg.get('save_folder', None),
+        save_interval=cfg.get('save_interval', '1000ba'),
+        save_num_checkpoints_to_keep=cfg.get('save_num_checkpoints_to_keep', -1),
+        load_path=cfg.get('load_path', None),
+        load_weights_only=cfg.get('load_weights_only', False),
+    )
+
+    print("Logging config...")
+    config_dict: Dict[str, Any] = om.to_container(cfg, resolve=True)  # type: ignore
+    config_dict.update({
+        'n_gpus': dist.get_world_size(),
+        'n_params': n_params,
+        'device_train_batch_size': device_train_batch_size,
+        'device_eval_batch_size': device_eval_batch_size,
+    })
+    if wandb.run is not None:
+        wandb.config.update(config_dict)
+
+    print("Starting training...")
+    trainer.fit()

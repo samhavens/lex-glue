@@ -1,13 +1,9 @@
 import logging
 from typing import List, Union
 
-from composer.utils import MissingConditionalImportError, dist
-
-try:
-    import datasets
-    from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
-except ImportError as e:
-    raise MissingConditionalImportError(extra_deps_group='nlp', conda_package='transformers') from e
+import datasets
+from composer.utils import dist
+from transformers.tokenization_utils_fast import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 
 _single_label = (None, "text", "label")  # none, str, int

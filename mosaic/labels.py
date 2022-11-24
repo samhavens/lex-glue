@@ -225,3 +225,13 @@ UNFAIR_CATEGORIES = [
 ]
 
 CASEHOLD_LABELS = ["0", "1", "2", "3", "4"]
+
+TASK_NAME_TO_NUM_LABELS = {
+    'case_hold': len(CASEHOLD_LABELS),
+    'ecthr_a': len(ECTHR_ARTICLES),
+    'ecthr_b': len(ECTHR_ARTICLES),
+    'eurlex': len(EUROVOC_CONCEPTS),
+    'ledgar': len(LEDGAR_CATEGORIES),
+    'scotus': len(SCDB_ISSUE_AREAS),
+    'unfair_tos': len(UNFAIR_CATEGORIES),
+}
