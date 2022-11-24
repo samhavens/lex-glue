@@ -71,4 +71,4 @@ if __name__ == "__main__":
     run_configs = [FineTuneRun.from_file(f) for f in yamls_to_run]
     for run_conf in run_configs:
         run = run_conf.create_run()
-        print(f'Launching run {run.name} with id {run.run_uid}')
+        print(f'Launching run {run.name} with id {run.run_uid}')  # type: ignore
