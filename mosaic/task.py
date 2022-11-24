@@ -94,7 +94,7 @@ def build_scheduler(cfg):
         raise ValueError(f'Not sure how to build scheduler: {cfg.name}')
 
 
-def build_model(cfg, task_name: str):
+def build_model(cfg: DictConfig, task_name: str):
     config = AutoConfig.from_pretrained(
         cfg.config_name if cfg.config_name else cfg.model_name_or_path,
         num_labels=TASK_NAME_TO_NUM_LABELS[task_name],
